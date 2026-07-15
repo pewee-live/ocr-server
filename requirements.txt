@@ -9,7 +9,12 @@ mcp==1.28.1
 pydantic==2.13.4
 pydantic-core==2.46.4
 paddleocr==3.7.0
-paddlepaddle==3.3.1
+# paddlepaddle 3.3.x has NO linux aarch64 wheel on PyPI. 3.2.2 is the latest
+# 3.x release that ships pre-built wheels for BOTH linux/amd64 and
+# linux/aarch64, so a single pin works across multi-arch Docker builds
+# (x86 servers + Raspberry Pi / Graviton). paddleocr/paddlex do not constrain
+# the paddlepaddle version, so 3.2.2 is a drop-in.
+paddlepaddle==3.2.2
 onnxruntime>=1.16
 paddle2onnx>=1.0
 pillow>=10.0
