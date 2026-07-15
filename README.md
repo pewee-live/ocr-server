@@ -39,6 +39,23 @@
 
 镜像构建时会预下载四种语言模型,容器启动即可调用、无需联网。
 
+#### 从 Docker Hub 拉取预构建镜像
+
+仓库提供手动触发的 [构建 workflow](.github/workflows/dockerhub-publish.yml),会在原生 runner 上并行构建 amd64 与 arm64 双架构镜像,合并为单个多架构 manifest 后发布到 Docker Hub。直接拉取即可,免去本地构建:
+
+```bash
+# 拉取镜像(自动匹配当前主机的 amd64 / arm64 架构)
+docker pull pewee-live/ocr-mcp:latest
+
+# 启动服务(仅本机访问)
+docker run -d --name ocr-mcp -p 8000:8000 pewee-live/ocr-mcp:latest
+```
+
+> `pewee-live` 为示例命名空间,请替换为你的 Docker Hub 用户名(需与仓库 Secrets 中的 `DOCKERHUB_USERNAME` 一致)。
+> 触发方式:GitHub 仓库 → Actions → 选择 **Build & Push to Docker Hub** → Run workflow,按需填写镜像名、标签与是否同步打 `:latest`。首次使用前需在 Secrets 中配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN`(Access Token,非密码)。
+
+#### 本地构建镜像
+
 ```bash
 # 构建镜像(首次会下载 paddlepaddle 与四种语言模型,约需数分钟)
 docker build -t ocr-mcp:latest .

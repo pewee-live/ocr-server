@@ -7,6 +7,7 @@ FROM python:3.11-slim AS base
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/home/app/.cache/huggingface \
@@ -31,7 +32,7 @@ WORKDIR /app
 
 # Install Python dependencies first to leverage Docker layer caching.
 COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip && pip install --prefer-binary -r requirements.txt
 
 # Install the package itself.
 COPY pyproject.toml ./
