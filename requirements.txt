@@ -1,0 +1,17 @@
+# Runtime dependencies for the PaddleOCR MCP server.
+# Versions are pinned for reproducible Docker builds; bump deliberately.
+# The heavy ML stack (paddleocr/paddlex/modelscope) and mcp both depend on
+# pydantic; with loose ranges pip's resolver backtracks through dozens of
+# pydantic/pydantic-core candidates and can fail with a spurious
+# "ResolutionImpossible" on the slim base image. Pinning the shared libs to the
+# known-good set below makes resolution deterministic and fast.
+mcp==1.28.1
+pydantic==2.13.4
+pydantic-core==2.46.4
+paddleocr==3.7.0
+paddlepaddle==3.3.1
+onnxruntime>=1.16
+paddle2onnx>=1.0
+pillow>=10.0
+numpy>=1.24,<3
+anyio>=4.0

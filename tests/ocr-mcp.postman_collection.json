@@ -1,0 +1,152 @@
+{
+  "info": {
+    "_postman_id": "f4c1a0e8-ocrm-cp01-2026-7c3e0b1a9001",
+    "name": "OCR MCP Server",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "End-to-end verification of the PaddleOCR MCP server over streamable-http. Send requests 1 -> 2 -> 3 in order. Session id is captured automatically. Set base_url and base64_image in the collection variables first."
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://192.168.137.94:8000",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "base64_image",
+      "value": "",
+      "type": "string",
+      "description": "data:image/png;base64,...  (generate with the PowerShell/python snippet in README)"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Initialize",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const sid = pm.response.headers.get('mcp-session-id');",
+              "if (sid) { pm.collectionVariables.set('session_id', sid); console.log('captured session_id:', sid); }",
+              "pm.test('initialize returned 200', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json, text/event-stream"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"postman\",\n      \"version\": \"1.0\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/mcp"
+      }
+    },
+    {
+      "name": "2. Notifications/initialized",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('initialized returned 202', () => pm.response.to.have.status(202));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json, text/event-stream"
+          },
+          {
+            "key": "mcp-session-id",
+            "value": "{{session_id}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"notifications/initialized\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/mcp"
+      }
+    },
+    {
+      "name": "3. recognize_text (base64)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('recognize_text returned 200', () => pm.response.to.have.status(200));",
+              "const raw = pm.response.text();",
+              "const m = raw.match(/data:\\s*(\\{[\\s\\S]*\\})/);",
+              "if (m) { try { const p = JSON.parse(m[1]); console.log('OCR result:', JSON.stringify(p.result)); } catch (e) { console.log('SSE parse error:', e.message); } }"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json, text/event-stream"
+          },
+          {
+            "key": "mcp-session-id",
+            "value": "{{session_id}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"recognize_text\",\n    \"arguments\": {\n      \"image\": \"{{base64_image}}\",\n      \"language\": \"ch\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/mcp"
+      }
+    }
+  ]
+}

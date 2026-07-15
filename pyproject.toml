@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocr-mcp"
+version = "0.1.0"
+description = "PaddleOCR (PP-OCRv5) exposed as a Model Context Protocol (MCP) server. Supports Chinese, English, Japanese and Korean."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ocr-mcp" }]
+keywords = ["mcp", "ocr", "paddleocr", "pp-ocr", "model-context-protocol"]
+dependencies = [
+    "mcp>=1.6,<2",
+    "paddleocr>=3.0,<4",
+    "paddlepaddle>=3.0,<4",
+    "pillow>=10.0",
+    "numpy>=1.24,<3",
+    "anyio>=4.0",
+]
+
+[project.scripts]
+ocr-mcp = "ocr_mcp.server:main"
+ocr-mcp-warmup = "ocr_mcp.warmup:main"
+
+[tool.setuptools.packages.find]
+include = ["ocr_mcp*"]
+
+[tool.setuptools.package-data]
+ocr_mcp = ["py.typed"]
