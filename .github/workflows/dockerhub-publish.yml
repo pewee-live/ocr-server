@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       image_repo:
-        description: "Docker Hub repository (username/repo). Leave blank to use <DOCKERHUB_USERNAME>/ocr-mcp."
+        description: "Docker Hub repository (username/repo). Leave blank to use <DOCKER_USERNAME>/ocr-mcp."
         required: false
         default: ""
       tag:
@@ -24,9 +24,9 @@ permissions:
   contents: read
 
 # Full image path without registry prefix, e.g. "myname/ocr-mcp".
-# Falls back to <DOCKERHUB_USERNAME>/ocr-mcp when image_repo is left blank.
+# Falls back to <DOCKER_USERNAME>/ocr-mcp when image_repo is left blank.
 env:
-  IMAGE: ${{ (inputs.image_repo != '' && inputs.image_repo) || format('{0}/ocr-mcp', secrets.DOCKERHUB_USERNAME) }}
+  IMAGE: ${{ (inputs.image_repo != '' && inputs.image_repo) || format('{0}/ocr-mcp', secrets.DOCKER_USERNAME) }}
 
 jobs:
   # Build each architecture independently on a native runner (no QEMU), pushing
@@ -55,8 +55,8 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push by digest
         id: build
@@ -104,8 +104,8 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
