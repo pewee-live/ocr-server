@@ -114,13 +114,16 @@ jobs:
           TAG: ${{ inputs.tag }}
           ALSO_LATEST: ${{ inputs.also_latest }}
         run: |
-          set -euo pipefail
-          TAGS=(-t "${IMAGE}:${TAG}")
-          if [ "${ALSO_LATEST}" = "true" ] && [ "${TAG}" != "latest" ]; then
-            TAGS+=(-t "${IMAGE}:latest")
-          fi
-          docker buildx imagetools create "${TAGS[@]}" \
-            $(printf '%s@sha256:%s ' "$IMAGE" *)
+         set -euo pipefail
+         TAGS=(-t "${IMAGE}:${TAG}")
+         if [ "${ALSO_LATEST}" = "true" ] && [ "${TAG}" != "latest" ]; then
+           TAGS+=(-t "${IMAGE}:latest")
+         fi
+          sources=()
+          for d in *; do
+            sources+=("${IMAGE}@sha256:${d}")
+          done
+          docker buildx imagetools create "${TAGS[@]}" "${sources[@]}"
 
       - name: Inspect image
         env:
