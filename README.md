@@ -99,6 +99,62 @@ python -m ocr_mcp
 首次运行时会自动从 Hugging Face 下载 PP-OCRv5 模型到本地缓存目录
 (`~/.paddlex/official_models`),之后可离线使用。
 
+### 切换模型:server(高精度)vs mobile(快速)
+
+本项目内置两套 PP-OCRv5 模型,Docker 镜像构建时已**同时预下载**,运行时通过环境变量切换,无需重新构建镜像或联网下载:
+
+| 变体 | 检测模型 | 识别模型 | 特点 |
+|------|---------|---------|------|
+| mobile(默认) | `PP-OCRv5_mobile_det` | `PP-OCRv5_mobile_rec` | 快 3-5 倍,适合运单等清晰印刷体 |
+| server | `PP-OCRv5_server_det` | `PP-OCRv5_server_rec` | 精度最高、最慢,适合复杂场景 |
+
+> 也可混搭,例如 mobile 检测(快)+ server 识别(准),只设一个、留空另一个即可。
+
+#### Docker 方式切换
+
+镜像里两套模型都预装了,启动时通过 `-e` 指定即可,切换后**首次调用需将模型加载进内存(数秒)**:
+
+```bash
+# 默认(mobile,快)— 镜像内置,直接 run
+docker run -d -p 8000:8000 ocr-mcp:latest
+
+# 切到 server(精度最高,慢)
+docker run -d -p 8000:8000 \
+  -e OCR_DET_MODEL=PP-OCRv5_server_det \
+  -e OCR_REC_MODEL=PP-OCRv5_server_rec \
+  ocr-mcp:latest
+
+# 混搭:mobile 检测(快)+ server 识别(准)
+docker run -d -p 8000:8000 \
+  -e OCR_DET_MODEL=PP-OCRv5_mobile_det \
+  -e OCR_REC_MODEL=PP-OCRv5_server_rec \
+  ocr-mcp:latest
+```
+
+#### Python 方式切换
+
+Python 方式同样用 `OCR_DET_MODEL` / `OCR_REC_MODEL`,首次切换会联网下载对应模型(之后缓存):
+
+```bash
+# 默认 server(Python 不像 Docker 有预设,需手动指定,否则按 PP-OCRv5 自动选 server)
+MCP_TRANSPORT=streamable-http python -m ocr_mcp
+
+# 切到 mobile(快)
+MCP_TRANSPORT=streamable-http \
+OCR_DET_MODEL=PP-OCRv5_mobile_det \
+OCR_REC_MODEL=PP-OCRv5_mobile_rec \
+python -m ocr_mcp
+
+# 切到 server(精度最高)
+MCP_TRANSPORT=streamable-http \
+OCR_DET_MODEL=PP-OCRv5_server_det \
+OCR_REC_MODEL=PP-OCRv5_server_rec \
+python -m ocr_mcp
+```
+
+> Windows PowerShell:
+> `$env:OCR_DET_MODEL='PP-OCRv5_mobile_det'; $env:OCR_REC_MODEL='PP-OCRv5_mobile_rec'; python -m ocr_mcp`
+
 ## 重要:跨机访问与 Host 白名单
 
 MCP SDK 默认开启 **DNS 重绑定防护**,只放行本机地址:
@@ -290,6 +346,10 @@ OCR 模型与推理相关:
 | `OCR_VERSION` | `PP-OCRv5` | PaddleOCR 模型版本。paddleocr >=3.7 默认 v6 会在 CPU 段错误,故锁回 v5。可选 `PP-OCRv4`/`PP-OCRv6` |
 | `OCR_PIR` | `0` | 设为 `1` 时不关闭 paddle 的 PIR 执行器(默认关闭以规避 CPU 段错误) |
 | `OCR_ENGINE` | 自动 | 推理引擎。aarch64(树莓派等)自动用 `onnxruntime` 规避 native 段错误;x86 用 `paddle`。可强制 `onnxruntime`/`paddle` |
+| `OCR_DEVICE` | `cpu` | 推理设备:`cpu` / `gpu` / `gpu:0`。用 `gpu` 需 GPU 版 paddlepaddle + NVIDIA 驱动 |
+| `OCR_DET_MODEL` | 镜像默认 mobile | 检测模型名,如 `PP-OCRv5_mobile_det`(快)/ `PP-OCRv5_server_det`(准)。留空则按 `ocr_version` 自动选 |
+| `OCR_REC_MODEL` | 镜像默认 mobile | 识别模型名,如 `PP-OCRv5_mobile_rec`(快)/ `PP-OCRv5_server_rec`(准)。留空则按 `ocr_version` 自动选 |
+| `OCR_MAX_IMAGE_SIDE` | `2880` | OCR 前将图片长边缩放到此值以下(像素)。调小可显著加速,但过小会丢失小字 |
 
 Docker 镜像默认设置 `MCP_TRANSPORT=streamable-http`。
 
@@ -365,6 +425,12 @@ ocr-server/
 - **CPU 推理**:`device="cpu"` + `enable_mkldnn=False`,规避 OneDNN 相关问题。如需 GPU,
   可在 [ocr_engine.py](ocr_mcp/ocr_engine.py) 中将 `device="cpu"` 改为 `"gpu"` 并移除
   `enable_mkldnn=False`,同时使用 GPU 版 paddlepaddle。
+- **模型变体(server / mobile 两套预热)**:镜像构建时通过 warmup 同时预下载 **server**
+  (高精度、慢)与 **mobile**(快 3-5 倍,适合运单等清晰印刷体)两套模型,运行时用
+  `OCR_DET_MODEL` / `OCR_REC_MODEL` 切换,无需重新 build 或联网下载。镜像默认 mobile。
+- **GPU 加速**:设置 `OCR_DEVICE=gpu` 即可走 GPU 推理(需 GPU 版 `paddlepaddle-gpu` +
+  NVIDIA 驱动 + `nvidia-container-toolkit`,`docker run --gpus all`)。aarch64(树莓派等)无
+  NVIDIA GPU,只能 CPU。
 - **ARM64(aarch64)用 ONNX Runtime**:paddlepaddle 3.x 的 aarch64 预编译包在推理时存在
   原生空指针段错误(native kernel,无环境变量可绕)。本项目在检测到 aarch64(树莓派、Graviton、
   Apple Silicon Docker 等)时自动改用 `engine='onnxruntime'`,完全绕开 paddle native kernel。
@@ -376,10 +442,10 @@ ocr-server/
 
 ## 依赖版本
 
-- paddleocr `3.7.0` + paddlepaddle `3.3.1`(CPU)
- onnxruntime + paddle2onnx(aarch64 推理所需)
-- mcp `1.28.1`
-- Python `>= 3.10`(镜像基于 `python:3.11-slim`)
+- paddleocr `3.7.0` + paddlepaddle `3.2.2`(3.2.2 是最高同时有 amd64/aarch64 wheel 的版本)
+ onnxruntime + paddle2onnx(ORT 引擎 / aarch64 推理所需)
+ pydantic `2.13.4` + mcp `1.28.1`(版本锁定,避免 pip 回溯解析失败)
+ Python `>= 3.10`(镜像基于 `python:3.11-slim`)
 
 ## License
 

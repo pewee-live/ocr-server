@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# Local OCR model cache
+. paddlex/
+.cache/
+
+# Generated samples (keep source generators, ignore outputs)
+sample_data/*.png

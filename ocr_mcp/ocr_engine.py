@@ -109,6 +109,47 @@ def resolve_lang(language: str | None) -> str:
     return code
 
 
+def _create_paddleocr(
+    lang: str,
+    det_model: str | None = None,
+    rec_model: str | None = None,
+) -> Any:
+    """Build a configured PaddleOCR instance for ``lang``.
+
+    ``det_model`` / ``rec_model`` default to the OCR_DET_MODEL / OCR_REC_MODEL
+    env vars; pass explicit names to override (used by warmup to pre-download
+    multiple model variants into the disk cache).
+    """
+    from paddleocr import PaddleOCR
+
+    # Pin to PP-OCRv5. paddleocr >=3.7 defaults to PP-OCRv6 when `lang` is
+    # given but `ocr_version` is omitted; PP-OCRv6 segfaults on CPU under
+    # paddlepaddle 3.x even with mkldnn disabled.
+    ocr_version = os.getenv("OCR_VERSION", "PP-OCRv5")
+    inference_engine = _select_inference_engine()
+    init_kwargs: dict[str, Any] = {
+        "lang": lang,
+        "ocr_version": ocr_version,
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        # "cpu" / "gpu" / "gpu:0". Needs a GPU build of paddlepaddle
+        # (paddlepaddle-gpu) + NVIDIA driver; see README GPU section.
+        "device": os.getenv("OCR_DEVICE", "cpu"),
+    }
+    det = (det_model or os.getenv("OCR_DET_MODEL", "")).strip()
+    rec = (rec_model or os.getenv("OCR_REC_MODEL", "")).strip()
+    if det:
+        init_kwargs["text_detection_model_name"] = det
+    if rec:
+        init_kwargs["text_recognition_model_name"] = rec
+    if inference_engine == "onnxruntime":
+        init_kwargs["engine"] = "onnxruntime"
+    else:
+        init_kwargs["enable_mkldnn"] = False
+    return PaddleOCR(**init_kwargs)
+
+
 class OCREngine:
     """Manages lazily-initialized, cached, thread-safe PaddleOCR instances."""
 
@@ -132,30 +173,7 @@ class OCREngine:
             # need PaddleOCR aren't forced to import the (heavy) paddle stack.
             from paddleocr import PaddleOCR
 
-            # Pin to PP-OCRv5. paddleocr >=3.7 defaults to PP-OCRv6 when `lang`
-            # is given but `ocr_version` is omitted; PP-OCRv6 segfaults on CPU
-            # under paddlepaddle 3.x even with mkldnn disabled. PP-OCRv5 is the
-            # version this project was built and verified against. Override with
-            # OCR_VERSION (e.g. PP-OCRv4 / PP-OCRv6) if you know your stack works.
-            ocr_version = os.getenv("OCR_VERSION", "PP-OCRv5")
-            # Select the inference engine. On aarch64 the paddle native engine
-            # segfaults at inference time, so we route through onnxruntime.
-            inference_engine = _select_inference_engine()
-            init_kwargs: dict[str, Any] = {
-                "lang": lang,
-                "ocr_version": ocr_version,
-                "use_doc_orientation_classify": False,
-                "use_doc_unwarping": False,
-                "use_textline_orientation": False,
-                "device": "cpu",
-            }
-            # `enable_mkldnn` only applies to the native paddle engine; it is
-            # meaningless (and may error) under onnxruntime.
-            if inference_engine == "onnxruntime":
-                init_kwargs["engine"] = "onnxruntime"
-            else:
-                init_kwargs["enable_mkldnn"] = False
-            engine = PaddleOCR(**init_kwargs)
+            engine = _create_paddleocr(lang)
             self._engines[lang] = engine
             return engine
 

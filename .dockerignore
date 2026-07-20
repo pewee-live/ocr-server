@@ -1,0 +1,35 @@
+# Version control
+.git
+.gitignore
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtualenvs
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# Test images / generated samples (keep them out of the image)
+sample_data/
+tests/
+
+# Misc
+.env
+.env.*
+*.log
+README.md
+*.md
