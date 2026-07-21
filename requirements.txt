@@ -8,7 +8,12 @@
 mcp==1.28.1
 pydantic==2.13.4
 pydantic-core==2.46.4
-paddleocr==3.7.0
+paddleocr[doc-parser]==3.7.0
+# The `doc-parser` extra pulls in paddlex[ocr] (premailer, openpyxl, lxml,
+# shapely, scikit-learn, scipy, latex2mathml, ...) which PP-StructureV3 needs
+# for layout / table analysis. Plain `paddleocr` only brings paddlex[ocr-core],
+# which is enough for text OCR but makes PP-StructureV3 fail with
+# "A dependency error occurred during pipeline creation".
 onnxruntime>=1.16
 # Pin paddlepaddle to a version that ships pre-built wheels for BOTH
 # linux/amd64 and linux/aarch64 (3.3.x has no aarch64 wheel). 3.2.2 is a

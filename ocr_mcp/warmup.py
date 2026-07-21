@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 
 from .ocr_engine import SUPPORTED_LANGS, _create_paddleocr
+from .layout_engine import _create_pp_structure
 
 # Model variants to pre-download. The "server" set is PaddleOCR's default
 # (high accuracy, slow); the "mobile" set is ~3-5x faster for clean documents
@@ -28,7 +29,19 @@ def main() -> int:
                 flush=True,
             )
             _create_paddleocr(lang, det_model, rec_model)
-    print("[warmup] all models ready (server + mobile)", flush=True)
+    # Pre-download the PP-StructureV3 model set. _create_pp_structure itself
+    # decides which sub-pipelines to enable based on the inference engine:
+    # under onnxruntime (aarch64 default, or OCR_ENGINE=onnxruntime) the
+    # formula/chart/seal models are skipped because they have no onnx package
+    # and would crash the build; under the native paddle engine (x86_64) they
+    # are included so invoice seal/chart/formula recognition works. Without
+    # this warmup the first recognize_layout call would hit the network for
+    # several multi-hundred-MB downloads (and the formula model is slow enough
+    # to cause runtime timeouts). One language is enough: layout/table/formula
+    # models are language-agnostic except for the OCR sub-model already cached.
+    print("[warmup] PP-Structure layout/table (+formula/chart/seal if paddle)", flush=True)
+    _create_pp_structure("ch")
+    print("[warmup] all models ready", flush=True)
     return 0
 
 

@@ -11,6 +11,7 @@ Transport is selected via the MCP_TRANSPORT env var:
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -28,18 +29,25 @@ from .ocr_engine import (
     resolve_lang,
     run_ocr,
 )
+from .layout_engine import (
+    LayoutEngine,
+    LayoutEngineError,
+    run_layout,
+)
 
 mcp = FastMCP(
     "PaddleOCR",
     instructions=(
         "OCR service backed by PaddleOCR (PP-OCRv5). Supports Chinese, English, "
  "Japanese and Korean. Use list_supported_languages to see language codes, "
-        "then recognize_text to extract text from an image."
+        "then recognize_text to extract text (with bounding boxes); "
+        "recognize_layout to recover page structure and tables (HTML + Markdown)."
     ),
 )
 
 # A single engine registry is shared across all tool calls; models load lazily.
 _engine = OCREngine()
+_layout_engine = LayoutEngine()
 
 def _build_transport_security() -> TransportSecuritySettings:
     """Extend the DNS-rebinding allowlist so network clients can reach us.
@@ -81,12 +89,15 @@ async def recognize_text(
             ("data:image/png;base64,..."), or a raw base64 string.
         language: OCR language - "ch" (Chinese+English), "en" (English),
             "japan" (Japanese), "korean" (Korean). Default "ch".
-        detail: When true, include per-line bounding boxes and confidences.
+        detail: When true, also include per-line confidence scores. Bounding
+            boxes are always returned (one per line) so the coordinates are
+            available without enabling detail.
         min_confidence: Drop lines below this confidence (0.0-1.0). 0 keeps all.
 
         Returns:
             A dict with "language", "count", "recognized_text" (newline-joined),
-            and when detail=true a "lines" list of {text, confidence, box}.
+            and a "lines" list of {text, box} (plus "confidence" when
+            detail=true).
             Note: the top-level key is "recognized_text" rather than "text"
             because Dify reserves "text" as a workflow variable name.
         """
@@ -111,9 +122,18 @@ async def recognize_text(
         "language": lang,
         "count": len(lines),
         "recognized_text": "\n".join(lines),
+        # Each line always carries its bounding box so callers can place text
+        # on the page; confidence is opt-in via ``detail`` to keep the default
+        # payload compact.
+        "lines": [
+            {
+                "text": it["text"],
+                "box": it["box"],
+                **({"confidence": it["confidence"]} if detail else {}),
+            }
+            for it in items
+        ],
     }
-    if detail:
-        result["lines"] = items
     return result
 
 
@@ -124,6 +144,95 @@ def list_supported_languages() -> dict[str, Any]:
         "languages": SUPPORTED_LANGS,
         "descriptions": {lang: LANG_DESCRIPTIONS[lang] for lang in SUPPORTED_LANGS},
     }
+
+
+@mcp.tool()
+async def recognize_layout(
+    image: str,
+    language: str = "ch",
+    output: str = "markdown",
+    flat: bool = True,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Recover page structure (layout + tables) using PP-Structure.
+
+    Unlike recognize_text (flat text lines), this runs full layout analysis:
+    it segments the page into regions (title / text / table / figure /
+    formula / ...), recognizes tables and converts them to both HTML and
+    Markdown, and reconstructs the reading order.
+
+    Args:
+        image: Local file path, an http(s) URL, a data URI
+            ("data:image/png;base64,..."), or a raw base64 string.
+        language: OCR language - "ch" / "en" / "japan" / "korean". Default "ch".
+        output: Top-level convenience content - "markdown" (the whole page as
+            Markdown, tables preserved) or "text" (flattened text only).
+           Structured data (regions/tables) is always returned regardless.
+        flat: When True (default), serialize regions/tables to JSON strings so
+            every field is a basic type (str/int). Required for Dify, whose
+            workflow variable system rejects nested dicts with
+            "Only basic types and lists are allowed". Pass False for nested
+            dicts (Codex / Claude / raw MCP).
+
+    Returns:
+        A dict with "language", "regions" (each {type, text, box, and for
+        tables html/markdown}), "tables" (each {html, markdown, box,
+        cell_count}), and "markdown" (the full page rendered as Markdown with
+        table layout preserved). On error returns {"error": ...}.
+    """
+    try:
+        lang = resolve_lang(language)
+        engine = _layout_engine.get_engine(lang)
+        image_input = load_image(image)
+    except (ValueError, OCRLoaderError, LayoutEngineError) as exc:
+       return {
+           "error": str(exc),
+           "language": None,
+            "region_count": 0,
+            "table_count": 0,
+           "markdown": "",
+           "regions_json": "[]",
+           "tables_json": "[]",
+        }
+
+    if ctx is not None:
+        await ctx.info(f"Running layout analysis ({lang}) ...")
+
+    structure, md = await anyio.to_thread.run_sync(run_layout, engine, image_input)
+
+    regions = structure.get("regions", [])
+    tables = structure.get("tables", [])
+
+    if flat:
+        # Dify (and similarly strict workflow variable systems) only accept
+        # basic types; the per-region/per-table records are dicts, which Dify
+        # rejects with "Only basic types and lists are allowed". Serialize them
+        # to JSON strings so every field is a basic type, while keeping the
+        # Markdown (the main deliverable) as a real string.
+        result: dict[str, Any] = {
+            "language": lang,
+            "region_count": len(regions),
+            "table_count": len(tables),
+            "markdown": md,
+            "regions_json": json.dumps(regions, ensure_ascii=False),
+            "tables_json": json.dumps(tables, ensure_ascii=False),
+        }
+    else:
+        result = {
+            "language": lang,
+            "region_count": len(regions),
+            "table_count": len(tables),
+            "regions": regions,
+            "tables": tables,
+            "markdown": md,
+        }
+    if structure.get("width") is not None:
+        result["width"] = structure["width"]
+    if structure.get("height") is not None:
+        result["height"] = structure["height"]
+    if output == "text":
+        result["text"] = "\n\n".join(r.get("text", "") for r in regions)
+    return result
 
 
 def _select_transport() -> str:

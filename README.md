@@ -5,6 +5,10 @@
 **中文、英文、日文、韩文**的文本识别,可被 Claude Desktop、Cursor、Codex 等
 任意 MCP 客户端调用,也可作为 Docker 镜像通过网络服务对外提供 OCR 能力。
 
+除纯文本识别外,还集成 **PP-Structure 版面分析**:对含表格/标题/段落的表单或
+文档,可自动还原版面结构,把图片中的表格直接转换为 HTML 与 Markdown 表格代码
+(保留行列结构),并返回每个文本区块的坐标框(Bounding Box)。
+
 提供两种运行方式,均支持 HTTP(`streamable-http`)传输:
 
 - **Docker**(推荐):镜像内置四种语言模型,构建后可完全离线运行。
@@ -15,7 +19,9 @@
 - 基于官方 MCP Python SDK(FastMCP),标准 `stdio` 与 `streamable-http` 双传输。
 - 每种语言独立缓存 OCR 引擎实例,首次调用懒加载、后续秒级响应。
 - 图片输入支持本地路径、`http(s)` URL、`data:` URI、裸 base64 字符串。
-- 返回每行文本、置信度和文本框坐标。
+- 返回每行文本、**文本框坐标(Bounding Box)** 与置信度。
+- **版面分析(`recognize_layout`)**:基于 PP-Structure 还原标题/段落/表格/图片
+  等版面区块,表格输出 HTML 与 Markdown(保留行列),并按阅读顺序返回各区块坐标。
 - Docker 镜像内置全部四种语言模型,**构建后可完全离线运行**。
 
 ## 支持的语言
@@ -128,6 +134,13 @@ docker run -d -p 8000:8000 \
 docker run -d -p 8000:8000 \
   -e OCR_DET_MODEL=PP-OCRv5_mobile_det \
   -e OCR_REC_MODEL=PP-OCRv5_server_rec \
+  ocr-mcp:latest
+  
+  
+ # 切到mobile 
+docker run -d -p 8000:8000 \
+  -e OCR_DET_MODEL=PP-OCRv5_mobile_det \
+  -e OCR_REC_MODEL=PP-OCRv5_mobile_rec \
   ocr-mcp:latest
 ```
 
@@ -306,7 +319,7 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 |------|------|------|------|
 | `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64 |
 | `language` | string | `"ch"` | 语言代码:`ch` / `en` / `japan` / `korean` |
-| `detail` | bool | `false` | 为 `true` 时返回每行的文本框 `box` 与置信度 `confidence` |
+| `detail` | bool | `false` | 坐标框 `box` 始终返回;为 `true` 时额外返回置信度 `confidence` |
 | `min_confidence` | float | `0.0` | 过滤低于该置信度的行(0-1,0 表示保留全部)|
 
 返回示例:
@@ -315,15 +328,78 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 {
   "language": "ch",
   "count": 2,
-  "text": "你好世界\nHello OCR",
+  "recognized_text": "你好世界\nHello OCR",
   "lines": [
-    {"text": "你好世界", "confidence": 0.98, "box": [[25, 58], [300, 58], [300, 114], [25, 114]]},
-    {"text": "Hello OCR", "confidence": 0.96, "box": null}
+    {"text": "你好世界", "box": [[25, 58], [300, 58], [300, 114], [25, 114]]},
+    {"text": "Hello OCR", "box": [[40, 120], [220, 120], [220, 154], [40, 154]]}
   ]
 }
 ```
 
-> `lines` 仅在 `detail=true` 时返回。
+> 每行 `lines` 始终返回,且自带坐标框 `box`;`detail=true` 时每行额外带 `confidence`。
+> 顶层键为 `recognized_text`(非 `text`,因 Dify 保留 `text` 作为工作流变量名)。
+> `box` 是四点角框 `[[x1,y1],[x2,y1],[x2,y2],[x1,y2]]`(顺时针、像素坐标,来自检测多边形);
+> 与 `recognize_layout` 的 `box`(`[x1,y1,x2,y2]` 四值轴对齐框)格式不同。
+
+### `recognize_layout`
+
+对图片执行**版面分析**(基于 PP-Structure),还原表格/标题/段落等结构。
+
+与 `recognize_text`(扁平文本行)不同,它把页面切分为多个版面区块
+(`title`/`text`/`table`/`figure`/`formula`/...),识别表格并转为 HTML 与 Markdown
+(保留行列结构),同时重建阅读顺序,每个区块都带坐标框 `box`。
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64 |
+| `language` | string | `"ch"` | 语言代码:`ch` / `en` / `japan` / `korean` |
+| `output` | string | `"markdown"` | 顶层便捷内容:`markdown`(整页 Markdown,表格保留)或 `text`(仅扁平文本)。结构化数据(`regions`/`tables`)始终返回 |
+| `flat` | bool | `true` | 输出形态开关,见下方「返回形态」:**Dify 用 `true`(默认)**,把 `regions`/`tables` 序列化为 JSON 字符串;Codex / Claude / 原始 MCP 用 `false` 取回嵌套 dict |
+
+返回字段:
+
+返回形态(`flat` 参数决定):
+
+| `flat` | 适用 | 结构化数据键 | 类型 |
+|-------|------|------------|------|
+| `true`(默认) | **Dify** | `regions_json` / `tables_json` | JSON 字符串(Dify 工作流变量只接受基本类型,嵌套 dict 会报 `Only basic types and lists are allowed`)|
+| `false` | Codex / Claude / 原始 MCP | `regions` / `tables` | 嵌套 dict / list |
+
+- `regions`:版面区块列表,每项含 `{type, text, box}`,表格区块额外含 `{html, markdown}`。
+- `tables`:识别到的表格列表,每项含 `{html, markdown, box, cell_count}`。
+- `markdown`:整页 Markdown 渲染结果,表格以 Markdown 表格语法保留行列结构。
+- `region_count` / `table_count`:区块数与表格数;`width`/`height`:页面像素尺寸。
+
+返回示例(含一张 2x2 表格的表单):
+
+```json
+{
+  "language": "ch",
+  "region_count": 2,
+  "table_count": 1,
+  "regions": [
+    {"type": "title", "text": "员工信息表", "box": [40, 20, 410, 70]},
+    {
+      "type": "table", "box": [30, 90, 430, 260],
+      "text": "<table><tr><td>姓名</td><td>年龄</td></tr>...</table>",
+      "html": "<table><tr><td>姓名</td><td>年龄</td></tr><tr><td>张三</td><td>30</td></tr></table>",
+      "markdown": "| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |"
+    }
+  ],
+  "tables": [
+    {"html": "<table>...</table>", "markdown": "| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |", "box": [30, 90, 430, 260], "cell_count": 4}
+  ],
+  "markdown": "# 员工信息表\n\n| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |"
+}
+```
+
+> `box` 为 `[x1, y1, x2, y2]`(左上/右下,像素坐标)。表格的 `markdown` 由服务端
+> 把识别出的 HTML 表格转换而来,`colspan`/`rowspan` 会展开为重复单元格以保持网格。
+
+> **引擎与子 pipeline**:`recognize_layout` 默认启用表格/版面/文字识别。公式/图表/印章
+> 识别**仅在原生 paddle 引擎**下可用(即 `OCR_ENGINE` 未强制 onnx、x86_64 环境)——paddlex
+> 的这三类模型没有 onnx 包,在 `onnxruntime` 引擎下(aarch64 默认 / `OCR_ENGINE=onnxruntime`)
+> 会被自动关闭(否则加载即报 `does not provide a 'onnx' package`)。设 `OCR_LAYOUT_FULL=1` 强制开启(仅 paddle 引擎有意义)。
 
 ### `list_supported_languages`
 
@@ -403,6 +479,7 @@ ocr-server/
 │   ├── __main__.py        # python -m ocr_mcp 入口
 │   ├── ocr_engine.py      # PaddleOCR 引擎封装与结果归一化
 │   ├── server.py          # FastMCP 服务与工具定义
+│   ├── layout_engine.py   # PP-Structure 版面/表格分析与 HTML→Markdown 转换
 │   └── warmup.py          # 模型预下载脚本(Docker 构建期调用)
 ├── tests/
 │   ├── make_test_image.py # 生成四语言测试图

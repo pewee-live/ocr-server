@@ -13,7 +13,7 @@ authors = [{ name = "ocr-mcp" }]
 keywords = ["mcp", "ocr", "paddleocr", "pp-ocr", "model-context-protocol"]
 dependencies = [
     "mcp>=1.6,<2",
-    "paddleocr>=3.0,<4",
+    "paddleocr[doc-parser]>=3.0,<4",
     "paddlepaddle>=3.0,<4",
     "pillow>=10.0",
     "numpy>=1.24,<3",
