@@ -26,6 +26,7 @@ from .ocr_engine import (
     OCREngine,
     OCRLoaderError,
     load_image,
+    release_input,
     resolve_lang,
     run_ocr,
 )
@@ -39,7 +40,8 @@ mcp = FastMCP(
     "PaddleOCR",
     instructions=(
         "OCR service backed by PaddleOCR (PP-OCRv5). Supports Chinese, English, "
- "Japanese and Korean. Use list_supported_languages to see language codes, "
+        "Japanese and Korean. Accepts images and PDFs (local path, http(s) URL, "
+        "or base64). Use list_supported_languages to see language codes, "
         "then recognize_text to extract text (with bounding boxes); "
         "recognize_layout to recover page structure and tables (HTML + Markdown)."
     ),
@@ -85,8 +87,9 @@ async def recognize_text(
     """Recognize text in an image using PaddleOCR (PP-OCRv5).
 
     Args:
-        image: Local file path, an http(s) URL, a data URI
-            ("data:image/png;base64,..."), or a raw base64 string.
+        image: Local file path (image or PDF), an http(s) URL, a data URI
+            ("data:image/png;base64,..."), or a raw base64 string. PDF files
+            are read natively by PaddleOCR and processed page by page.
         language: OCR language - "ch" (Chinese+English), "en" (English),
             "japan" (Japanese), "korean" (Korean). Default "ch".
         detail: When true, also include per-line confidence scores. Bounding
@@ -111,30 +114,36 @@ async def recognize_text(
     if ctx is not None:
         await ctx.info(f"Running OCR ({lang}) ...")
 
-    # Offload the blocking inference so the event loop stays responsive.
-    items = await anyio.to_thread.run_sync(_blocking_recognize, engine, image_input)
+    try:
+        # Offload the blocking inference so the event loop stays responsive.
+        items = await anyio.to_thread.run_sync(_blocking_recognize, engine, image_input)
 
-    if min_confidence and min_confidence > 0.0:
-        items = [it for it in items if (it["confidence"] or 0.0) >= min_confidence]
+        if min_confidence and min_confidence > 0.0:
+            items = [it for it in items if (it["confidence"] or 0.0) >= min_confidence]
 
-    lines = [it["text"] for it in items]
-    result: dict[str, Any] = {
-        "language": lang,
-        "count": len(lines),
-        "recognized_text": "\n".join(lines),
-        # Each line always carries its bounding box so callers can place text
-        # on the page; confidence is opt-in via ``detail`` to keep the default
-        # payload compact.
-        "lines": [
-            {
-                "text": it["text"],
-                "box": it["box"],
-                **({"confidence": it["confidence"]} if detail else {}),
-            }
-            for it in items
-        ],
-    }
-    return result
+        lines = [it["text"] for it in items]
+        result: dict[str, Any] = {
+            "language": lang,
+            "count": len(lines),
+            "recognized_text": "\n".join(lines),
+            # Each line always carries its bounding box (and, for multi-page
+            # PDFs, its 0-based page index) so callers can place text on the
+            # page; confidence is opt-in via ``detail`` to keep the default
+            # payload compact.
+            "lines": [
+                {
+                    "text": it["text"],
+                    "box": it["box"],
+                    "page": it["page"],
+                    **({"confidence": it["confidence"]} if detail else {}),
+                }
+                for it in items
+            ],
+        }
+        return result
+    finally:
+        # Remove temp PDFs created for URL/base64 sources; no-op for images.
+        release_input(image_input)
 
 
 @mcp.tool()
@@ -162,8 +171,9 @@ async def recognize_layout(
     Markdown, and reconstructs the reading order.
 
     Args:
-        image: Local file path, an http(s) URL, a data URI
-            ("data:image/png;base64,..."), or a raw base64 string.
+        image: Local file path (image or PDF), an http(s) URL, a data URI
+            ("data:image/png;base64,..."), or a raw base64 string. PDF files
+            are read natively by PaddleOCR and processed page by page.
         language: OCR language - "ch" / "en" / "japan" / "korean". Default "ch".
         output: Top-level convenience content - "markdown" (the whole page as
             Markdown, tables preserved) or "text" (flattened text only).
@@ -198,41 +208,47 @@ async def recognize_layout(
     if ctx is not None:
         await ctx.info(f"Running layout analysis ({lang}) ...")
 
-    structure, md = await anyio.to_thread.run_sync(run_layout, engine, image_input)
+    try:
+        structure, md = await anyio.to_thread.run_sync(run_layout, engine, image_input)
 
-    regions = structure.get("regions", [])
-    tables = structure.get("tables", [])
+        regions = structure.get("regions", [])
+        tables = structure.get("tables", [])
 
-    if flat:
-        # Dify (and similarly strict workflow variable systems) only accept
-        # basic types; the per-region/per-table records are dicts, which Dify
-        # rejects with "Only basic types and lists are allowed". Serialize them
-        # to JSON strings so every field is a basic type, while keeping the
-        # Markdown (the main deliverable) as a real string.
-        result: dict[str, Any] = {
-            "language": lang,
-            "region_count": len(regions),
-            "table_count": len(tables),
-            "markdown": md,
-            "regions_json": json.dumps(regions, ensure_ascii=False),
-            "tables_json": json.dumps(tables, ensure_ascii=False),
-        }
-    else:
-        result = {
-            "language": lang,
-            "region_count": len(regions),
-            "table_count": len(tables),
-            "regions": regions,
-            "tables": tables,
-            "markdown": md,
-        }
-    if structure.get("width") is not None:
-        result["width"] = structure["width"]
-    if structure.get("height") is not None:
-        result["height"] = structure["height"]
-    if output == "text":
-        result["text"] = "\n\n".join(r.get("text", "") for r in regions)
-    return result
+        if flat:
+            # Dify (and similarly strict workflow variable systems) only accept
+            # basic types; the per-region/per-table records are dicts, which Dify
+            # rejects with "Only basic types and lists are allowed". Serialize them
+            # to JSON strings so every field is a basic type, while keeping the
+            # Markdown (the main deliverable) as a real string.
+            result: dict[str, Any] = {
+                "language": lang,
+                "region_count": len(regions),
+                "table_count": len(tables),
+                "markdown": md,
+                "regions_json": json.dumps(regions, ensure_ascii=False),
+                "tables_json": json.dumps(tables, ensure_ascii=False),
+            }
+        else:
+            result = {
+                "language": lang,
+                "region_count": len(regions),
+                "table_count": len(tables),
+                "regions": regions,
+                "tables": tables,
+                "markdown": md,
+            }
+        if structure.get("width") is not None:
+            result["width"] = structure["width"]
+        if structure.get("height") is not None:
+            result["height"] = structure["height"]
+        if structure.get("page_count") is not None:
+            result["page_count"] = structure["page_count"]
+        if output == "text":
+            result["text"] = "\n\n".join(r.get("text", "") for r in regions)
+        return result
+    finally:
+        # Remove temp PDFs created for URL/base64 sources; no-op for images.
+        release_input(image_input)
 
 
 def _select_transport() -> str:

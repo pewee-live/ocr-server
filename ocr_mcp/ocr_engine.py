@@ -14,6 +14,7 @@ import platform
 import re
 import sysconfig
 import threading
+import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -196,25 +197,63 @@ def _bytes_to_ndarray(data: bytes) -> np.ndarray:
         raise OCRLoaderError("Could not decode image bytes into an array.") from exc
 
 
-def _decode_base64_image(raw: str) -> np.ndarray:
-    """Decode a plain or data-URI base64 string into an RGB numpy array."""
+def _decode_to_bytes(raw: str) -> bytes:
+    """Decode a plain or data-URI base64 string into raw bytes."""
     match = _DATA_URI_RE.match(raw.strip())
     payload = match.group(1) if match else raw.strip()
     try:
-        data = base64.b64decode(payload)
+        return base64.b64decode(payload)
     except Exception as exc:  # pragma: no cover - defensive
         raise OCRLoaderError("Image source looked like base64 but could not be decoded.") from exc
-    return _bytes_to_ndarray(data)
 
 
-def _download(url: str) -> np.ndarray:
+def _download_bytes(url: str) -> bytes:
+    """Download a URL's raw bytes (works for both images and PDFs)."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "ocr-mcp/0.1"})
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - user URL
-            data = resp.read()
+            return resp.read()
     except Exception as exc:
         raise OCRLoaderError(f"Failed to download image from URL: {url}") from exc
-    return _bytes_to_ndarray(data)
+
+
+# PDF inputs are materialized to temp files because PaddleOCR reads PDFs by path
+# (it cannot consume raw PDF bytes / ndarrays). Temp paths are tracked here so
+# callers can clean them up after inference via release_input().
+_TEMP_PATHS: set[str] = set()
+
+# Magic bytes that identify a PDF stream (all PDF versions start with "%PDF").
+_PDF_MAGIC = b"%PDF"
+
+
+def _is_pdf_bytes(data: bytes) -> bool:
+    return data[: len(_PDF_MAGIC)] == _PDF_MAGIC
+
+
+def _materialize_pdf(data: bytes) -> str:
+    """Write PDF bytes to a temp file and return its path for native PaddleOCR use."""
+    fd, path = tempfile.mkstemp(suffix=".pdf", prefix="ocr_mcp_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception as exc:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise OCRLoaderError("Could not write PDF to a temporary file.") from exc
+    _TEMP_PATHS.add(path)
+    return path
+
+
+def release_input(image_input: Any) -> None:
+    """Remove a temp PDF created by ``load_image``; no-op for real paths / arrays."""
+    if isinstance(image_input, str) and image_input in _TEMP_PATHS:
+        _TEMP_PATHS.discard(image_input)
+        try:
+            os.remove(image_input)
+        except OSError:
+            pass
 
 
 def _looks_like_base64(src: str) -> bool:
@@ -227,16 +266,22 @@ def _looks_like_base64(src: str) -> bool:
 
 
 def load_image(source: str) -> Any:
-    """Resolve an image source to something ``PaddleOCR.predict`` accepts.
+    """Resolve an image/PDF source to something ``PaddleOCR.predict`` accepts.
 
-    Returns either an absolute file path (str) or an ``np.ndarray`` (RGB).
+    Accepts a local file path (image or PDF), an http(s) URL, a data URI, or a
+    raw base64 string. Images become an ``np.ndarray`` (RGB) or are returned as
+    a path for PaddleOCR to read directly; PDFs are always returned as a file
+    path so PaddleOCR can read them natively (page by page). Temp PDF files
+    created for URL/base64 sources are tracked for cleanup via release_input().
     """
     if not isinstance(source, str) or not source.strip():
         raise OCRLoaderError("Image source is empty.")
 
     src = source.strip()
 
-    # 1) Existing local file -> let PaddleOCR read the path directly.
+    # 1) Existing local file (image OR PDF) -> let PaddleOCR read the path
+    #    directly. PaddleOCR/PaddleX read PDFs natively (via PyMuPDF), one
+    #    result object per page, so we never pre-decode PDFs here.
     candidate = Path(src)
     try:
         if candidate.exists() and candidate.is_file():
@@ -247,10 +292,14 @@ def load_image(source: str) -> Any:
         pass
 
     lowered = src.lower()
+    # 2) http(s) URL -> raw bytes; dispatch PDFs to a temp file, images to array.
     if lowered.startswith("http://") or lowered.startswith("https://"):
-        return _download(src)
+        data = _download_bytes(src)
+        return _materialize_pdf(data) if _is_pdf_bytes(data) else _bytes_to_ndarray(data)
+    # 3) data-URI / base64 -> raw bytes; same PDF/image dispatch.
     if lowered.startswith("data:") or _looks_like_base64(src):
-        return _decode_base64_image(src)
+        data = _decode_to_bytes(src)
+        return _materialize_pdf(data) if _is_pdf_bytes(data) else _bytes_to_ndarray(data)
 
     raise OCRLoaderError(
         "Image source is not a recognizable local path, http(s) URL, "
@@ -327,12 +376,20 @@ def _normalize_result(res: Any) -> list[dict[str, Any]]:
 
 
 def run_ocr(engine: Any, image_input: Any) -> list[dict[str, Any]]:
-    """Run OCR for a single image and return normalized per-line results."""
+    """Run OCR for an image/PDF and return normalized per-line results.
+
+    For multi-page PDFs, PaddleOCR returns one result object per page; each
+    emitted line is tagged with its 0-based ``page`` index, and bounding boxes
+    are expressed in each page's own coordinate space.
+    """
     image_input = _resize_for_ocr(image_input)
     results = engine.predict(image_input)
+    items = results if isinstance(results, list) else [results]
     lines: list[dict[str, Any]] = []
-    for res in results:
-        lines.extend(_normalize_result(res))
+    for page_idx, res in enumerate(items):
+        for line in _normalize_result(res):
+            line["page"] = page_idx
+            lines.append(line)
     return lines
 
 
@@ -350,6 +407,10 @@ def _resize_for_ocr(image_input: Any) -> Any:
         return image_input
 
     if isinstance(image_input, str):
+        # PDFs are handed to PaddleOCR natively (read page by page with
+        # PyMuPDF inside the engine), so never try to open them with Pillow.
+        if image_input.lower().endswith(".pdf"):
+            return image_input
         try:
             img = Image.open(image_input)
         except Exception:

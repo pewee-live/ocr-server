@@ -6,8 +6,8 @@
 任意 MCP 客户端调用,也可作为 Docker 镜像通过网络服务对外提供 OCR 能力。
 
 除纯文本识别外,还集成 **PP-Structure 版面分析**:对含表格/标题/段落的表单或
-文档,可自动还原版面结构,把图片中的表格直接转换为 HTML 与 Markdown 表格代码
-(保留行列结构),并返回每个文本区块的坐标框(Bounding Box)。
+文档,可自动还原版面结构,把图片或 PDF 中的表格直接转换为 HTML 与 Markdown 表格代码
+(保留行列结构),并返回每个文本区块的坐标框(Bounding Box)。PDF 按页逐张处理。
 
 提供两种运行方式,均支持 HTTP(`streamable-http`)传输:
 
@@ -18,7 +18,10 @@
 
 - 基于官方 MCP Python SDK(FastMCP),标准 `stdio` 与 `streamable-http` 双传输。
 - 每种语言独立缓存 OCR 引擎实例,首次调用懒加载、后续秒级响应。
-- 图片输入支持本地路径、`http(s)` URL、`data:` URI、裸 base64 字符串。
+- 图片与 PDF 输入均支持本地路径、`http(s)` URL、`data:` URI、裸 base64 字符串。
+- **原生 PDF 支持**:PDF 交给 PaddleOCR/PaddleX 按页逐张处理(依赖 PyMuPDF),
+  多页结果自动合并,每个文本行/区块/表格都带 `page` 页码;`recognize_layout`
+  额外返回 `page_count` 总页数。
 - 返回每行文本、**文本框坐标(Bounding Box)** 与置信度。
 - **版面分析(`recognize_layout`)**:基于 PP-Structure 还原标题/段落/表格/图片
   等版面区块,表格输出 HTML 与 Markdown(保留行列),并按阅读顺序返回各区块坐标。
@@ -217,7 +220,8 @@ curl -i -X POST http://192.168.7.49:8000/mcp \
 
 **第 0 步:准备 base64 图片**
 
-Postman 无法直接读取本地文件,需先把图片转成 data URI。任选一种:
+Postman 无法直接读取本地文件,需先把图片转成 data URI。任选一种(PDF 同理,把
+`image/pdf` 作为 MIME 即可):
 
 ```powershell
 # PowerShell(Windows):输出一整行 data URI,复制备用
@@ -313,11 +317,11 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 
 ### `recognize_text`
 
-对图片执行 OCR 文本识别。
+对图片或 PDF 执行 OCR 文本识别。
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64 |
+| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64;支持图片与 PDF |
 | `language` | string | `"ch"` | 语言代码:`ch` / `en` / `japan` / `korean` |
 | `detail` | bool | `false` | 坐标框 `box` 始终返回;为 `true` 时额外返回置信度 `confidence` |
 | `min_confidence` | float | `0.0` | 过滤低于该置信度的行(0-1,0 表示保留全部)|
@@ -330,20 +334,23 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
   "count": 2,
   "recognized_text": "你好世界\nHello OCR",
   "lines": [
-    {"text": "你好世界", "box": [[25, 58], [300, 58], [300, 114], [25, 114]]},
-    {"text": "Hello OCR", "box": [[40, 120], [220, 120], [220, 154], [40, 154]]}
+    {"text": "你好世界", "box": [[25, 58], [300, 58], [300, 114], [25, 114]], "page": 0},
+    {"text": "Hello OCR", "box": [[40, 120], [220, 120], [220, 154], [40, 154]], "page": 0}
   ]
 }
 ```
 
-> 每行 `lines` 始终返回,且自带坐标框 `box`;`detail=true` 时每行额外带 `confidence`。
+> 每行 `lines` 始终返回,且自带坐标框 `box` 与 `page` 页码(从 0 开始);`detail=true` 时每行额外带 `confidence`。
 > 顶层键为 `recognized_text`(非 `text`,因 Dify 保留 `text` 作为工作流变量名)。
 > `box` 是四点角框 `[[x1,y1],[x2,y1],[x2,y2],[x1,y2]]`(顺时针、像素坐标,来自检测多边形);
 > 与 `recognize_layout` 的 `box`(`[x1,y1,x2,y2]` 四值轴对齐框)格式不同。
+>
+> **多页 PDF**:PDF 按页逐张识别,各行带 `page` 页码(0 起),`box` 坐标基于其所在页;
+> `recognized_text` 把所有页的文本按顺序换行拼接。
 
 ### `recognize_layout`
 
-对图片执行**版面分析**(基于 PP-Structure),还原表格/标题/段落等结构。
+对图片或 PDF 执行**版面分析**(基于 PP-Structure),还原表格/标题/段落等结构。
 
 与 `recognize_text`(扁平文本行)不同,它把页面切分为多个版面区块
 (`title`/`text`/`table`/`figure`/`formula`/...),识别表格并转为 HTML 与 Markdown
@@ -351,7 +358,7 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64 |
+| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64;支持图片与 PDF |
 | `language` | string | `"ch"` | 语言代码:`ch` / `en` / `japan` / `korean` |
 | `output` | string | `"markdown"` | 顶层便捷内容:`markdown`(整页 Markdown,表格保留)或 `text`(仅扁平文本)。结构化数据(`regions`/`tables`)始终返回 |
 | `flat` | bool | `true` | 输出形态开关,见下方「返回形态」:**Dify 用 `true`(默认)**,把 `regions`/`tables` 序列化为 JSON 字符串;Codex / Claude / 原始 MCP 用 `false` 取回嵌套 dict |
@@ -365,10 +372,11 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 | `true`(默认) | **Dify** | `regions_json` / `tables_json` | JSON 字符串(Dify 工作流变量只接受基本类型,嵌套 dict 会报 `Only basic types and lists are allowed`)|
 | `false` | Codex / Claude / 原始 MCP | `regions` / `tables` | 嵌套 dict / list |
 
-- `regions`:版面区块列表,每项含 `{type, text, box}`,表格区块额外含 `{html, markdown}`。
-- `tables`:识别到的表格列表,每项含 `{html, markdown, box, cell_count}`。
-- `markdown`:整页 Markdown 渲染结果,表格以 Markdown 表格语法保留行列结构。
+- `regions`:版面区块列表,每项含 `{type, text, box, page}`,表格区块额外含 `{html, markdown}`。
+- `tables`:识别到的表格列表,每项含 `{html, markdown, box, cell_count, page}`。
+- `markdown`:整页 Markdown 渲染结果,表格以 Markdown 表格语法保留行列结构;多页 PDF 时各页之间以 `---` 分隔。
 - `region_count` / `table_count`:区块数与表格数;`width`/`height`:页面像素尺寸。
+- `page_count`:页数(单张图片为 `1`,PDF 为实际页数)。
 
 返回示例(含一张 2x2 表格的表单):
 
@@ -378,7 +386,7 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
   "region_count": 2,
   "table_count": 1,
   "regions": [
-    {"type": "title", "text": "员工信息表", "box": [40, 20, 410, 70]},
+    {"type": "title", "text": "员工信息表", "box": [40, 20, 410, 70], "page": 0},
     {
       "type": "table", "box": [30, 90, 430, 260],
       "text": "<table><tr><td>姓名</td><td>年龄</td></tr>...</table>",
@@ -387,13 +395,16 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
     }
   ],
   "tables": [
-    {"html": "<table>...</table>", "markdown": "| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |", "box": [30, 90, 430, 260], "cell_count": 4}
+    {"html": "<table>...</table>", "markdown": "| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |", "box": [30, 90, 430, 260], "cell_count": 4, "page": 0}
   ],
   "markdown": "# 员工信息表\n\n| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |"
 }
 ```
 
-> `box` 为 `[x1, y1, x2, y2]`(左上/右下,像素坐标)。表格的 `markdown` 由服务端
+> 上例为单页(图片或单页 PDF),故顶层 `page_count` 省略(为 `1`)。多页 PDF 时
+> 每个 region/table 都带其所在页的 `page` 索引(0 起),并额外返回顶层 `page_count`。
+>
+> `box` 为 `[x1, y1, x2, y2]`(左上/右下,像素坐标,基于其所在页)。表格的 `markdown` 由服务端
 > 把识别出的 HTML 表格转换而来,`colspan`/`rowspan` 会展开为重复单元格以保持网格。
 
 > **引擎与子 pipeline**:`recognize_layout` 默认启用表格/版面/文字识别。公式/图表/印章
@@ -516,6 +527,11 @@ ocr-server/
   模型权重写入 `/home/app/.paddlex/official_models`,使运行期不再依赖网络。
 - **线程安全**:OCR 推理通过 `anyio.to_thread.run_sync` 在工作线程中执行,避免阻塞
   MCP 事件循环;引擎实例以语言为键缓存,带双重检查锁。
+- **PDF 支持**:PDF 直接交给 PaddleOCR/PaddleX 的 `predict()` 原生按页处理(内部用
+  PyMuPDF 解码各页),不预先栅格化。本服务仅负责:把 URL/base64 形式的 PDF 落成临时文件
+  再透传路径(URL/base64 无法被引擎当字节消费),并在推理后清理临时文件;本地 PDF 路径则
+  原样透传。多页结果按页合并,每行/区块/表格带 `page`,`recognize_layout` 额外返回 `page_count`,
+  多页 Markdown 以 `---` 分页。
 
 ## 依赖版本
 

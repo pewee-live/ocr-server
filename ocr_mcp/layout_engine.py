@@ -397,8 +397,16 @@ def _normalize_layout_result(res: Any) -> dict[str, Any]:
         cell_boxes = t.get("cell_box_list") or []
         entry: dict[str, Any] = {
             "html": str(html),
-            "markdown": html_table_to_markdown(str(html)) if html else "",
-            "box": _bbox_to_list(t.get("table_bbox") or t.get("table_region")),
+           "markdown": html_table_to_markdown(str(html)) if html else "",
+            # PP-StructureV3 stores the table's layout bbox under "block_bbox"
+            # (see paddlex layout_parsing.pipeline_v2 docstring). Fall back to
+            # other names seen in older/alternate result shapes.
+            "box": _bbox_to_list(
+                t.get("block_bbox")
+                or t.get("table_bbox")
+                or t.get("table_region")
+                or t.get("bbox")
+            ),
             "cell_count": len(cell_boxes),
         }
         if region_id is not None:
@@ -424,33 +432,43 @@ def run_layout(engine: Any, image_input: Any) -> tuple[dict[str, Any], str]:
     image_input = _resize_for_ocr(image_input)
     results = engine.predict(image_input)
     if results is None:
-        return {"regions": [], "tables": []}, ""
+        return {"regions": [], "tables": [], "page_count": 0}, ""
 
-    # Predict may yield a list (3.x) or already a single result (legacy 2.x).
-    if isinstance(results, list):
-        items = results
-    else:
-        items = [results]
+    # Predict may yield a list (3.x, one result per PDF page) or already a
+    # single result (legacy 2.x / single image).
+    items = results if isinstance(results, list) else [results]
 
     merged_regions: list[dict[str, Any]] = []
     merged_tables: list[dict[str, Any]] = []
     md_pages: list[str] = []
     width = height = None
-    for res in items:
+    for page_idx, res in enumerate(items):
         norm = _normalize_layout_result(res)
-        merged_regions.extend(norm["regions"])
-        merged_tables.extend(norm["tables"])
+        for region in norm["regions"]:
+            region["page"] = page_idx
+            merged_regions.append(region)
+        for table in norm["tables"]:
+            table["page"] = page_idx
+            merged_tables.append(table)
         width = norm.get("width") or width
         height = norm.get("height") or height
         md_pages.append(_result_markdown(res))
+
+    # Separate pages with a thematic break so multi-page PDFs stay readable
+    # without merging adjacent tables across page boundaries.
+    md_clean = [p for p in md_pages if p and p.strip()]
+    if len(md_clean) > 1:
+        markdown = "\n\n---\n\n".join(md_clean)
+    else:
+        markdown = md_clean[0] if md_clean else ""
 
     structure = {
         "regions": merged_regions,
         "tables": merged_tables,
         "width": width,
         "height": height,
+        "page_count": len(items),
     }
-    markdown = "\n\n".join(p for p in md_pages if p and p.strip())
     return structure, markdown
 
 

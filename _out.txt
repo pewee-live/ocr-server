@@ -1,0 +1,12 @@
+﻿.github
+ocr_mcp
+sample_data
+tests
+.dockerignore
+.gitignore
+.tmp_pocr.whl
+Dockerfile
+pyproject.toml
+README.md
+requirements.txt
+_listing.txt
