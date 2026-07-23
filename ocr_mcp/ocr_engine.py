@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import logging
 import platform
 import re
 import sysconfig
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger("ocr_mcp.engine")
 
 # paddlepaddle 3.x can segfault on the CPU PIR execution path
 # (ConvertPirAttribute2RuntimeAttribute) regardless of `enable_mkldnn`.
@@ -177,7 +180,11 @@ class OCREngine:
             # need PaddleOCR aren't forced to import the (heavy) paddle stack.
             from paddleocr import PaddleOCR
 
+            logger.info("[engine] first use for lang '%s', creating PaddleOCR instance (may download models)...", lang)
+            import time as _time
+            _t0 = _time.monotonic()
             engine = _create_paddleocr(lang)
+            logger.info("[engine] PaddleOCR instance for '%s' ready in %.1fs", lang, _time.monotonic() - _t0)
             self._engines[lang] = engine
             return engine
 
@@ -193,30 +200,43 @@ class OCREngine:
 def _bytes_to_ndarray(data: bytes) -> np.ndarray:
     from PIL import Image
 
+    logger.info("[decode] decoding %d image bytes with Pillow", len(data))
     try:
         img = Image.open(io.BytesIO(data))
-        return np.array(img.convert("RGB"))
+        arr = np.array(img.convert("RGB"))
+        logger.info("[decode] decoded to ndarray %s", arr.shape)
+        return arr
     except Exception as exc:  # pragma: no cover - defensive
+        logger.error("[decode] Pillow failed to decode %d bytes: %s", len(data), exc, exc_info=True)
         raise OCRLoaderError("Could not decode image bytes into an array.") from exc
 
 
 def _decode_to_bytes(raw: str) -> bytes:
     """Decode a plain or data-URI base64 string into raw bytes."""
+    is_data_uri = raw.strip().lower().startswith("data:")
+    logger.info("[base64] decoding %s (%d chars)", "data-URI" if is_data_uri else "raw base64", len(raw))
     match = _DATA_URI_RE.match(raw.strip())
     payload = match.group(1) if match else raw.strip()
     try:
-        return base64.b64decode(payload)
+        data = base64.b64decode(payload)
+        logger.info("[base64] decoded %d bytes", len(data))
+        return data
     except Exception as exc:  # pragma: no cover - defensive
+        logger.error("[base64] decode failed: %s", exc, exc_info=True)
         raise OCRLoaderError("Image source looked like base64 but could not be decoded.") from exc
 
 
 def _download_bytes(url: str) -> bytes:
     """Download a URL's raw bytes (works for both images and PDFs)."""
+    logger.info("[download] fetching %s", url)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "ocr-mcp/0.1"})
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - user URL
-            return resp.read()
+            data = resp.read()
+        logger.info("[download] got %d bytes from %s", len(data), url)
+        return data
     except Exception as exc:
+        logger.error("[download] failed to fetch %s: %s", url, exc, exc_info=True)
         raise OCRLoaderError(f"Failed to download image from URL: {url}") from exc
 
 
@@ -235,16 +255,19 @@ def _is_pdf_bytes(data: bytes) -> bool:
 
 def _materialize_pdf(data: bytes) -> str:
     """Write PDF bytes to a temp file and return its path for native PaddleOCR use."""
+    logger.info("[pdf] writing %d PDF bytes to temp file", len(data))
     fd, path = tempfile.mkstemp(suffix=".pdf", prefix="ocr_mcp_")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
     except Exception as exc:
+        logger.error("[pdf] failed to write temp PDF: %s", exc, exc_info=True)
         try:
             os.remove(path)
         except OSError:
             pass
         raise OCRLoaderError("Could not write PDF to a temporary file.") from exc
+    logger.info("[pdf] temp PDF ready: %s", path)
     _TEMP_PATHS.add(path)
     return path
 
@@ -279,14 +302,19 @@ def _office_to_pdf(src_path: str) -> str:
     """
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
+        logger.error("[office] soffice not found on PATH")
         raise OCRLoaderError(
             "LibreOffice (soffice) is not installed; cannot convert office "
             "documents. Install it in the server environment to enable "
             "doc/ppt/xls support."
         )
+    logger.info("[office] found soffice: %s", soffice)
     src = Path(src_path)
     outdir = tempfile.mkdtemp(prefix="lo_out_")
     profile = tempfile.mkdtemp(prefix="lo_prof_")
+    logger.info("[office] converting '%s' (%s) -> PDF (outdir=%s)", src.name, src.suffix, outdir)
+    import time as _time
+    _t0 = _time.monotonic()
     try:
         subprocess.run(
             [
@@ -303,8 +331,10 @@ def _office_to_pdf(src_path: str) -> str:
             check=True,
             capture_output=True,
         )
+        logger.info("[office] soffice exited in %.1fs", _time.monotonic() - _t0)
         pdf = Path(outdir) / f"{src.stem}.pdf"
         if not pdf.exists():
+            logger.error("[office] no output PDF produced for '%s'", src.name)
             raise OCRLoaderError(
                 f"LibreOffice produced no PDF for '{src.name}'. The file may be "
                 "corrupted or in an unsupported format."
@@ -315,11 +345,14 @@ def _office_to_pdf(src_path: str) -> str:
         os.close(fd)
         shutil.move(str(pdf), final)
         _TEMP_PATHS.add(final)
+        logger.info("[office] '%s' -> temp PDF %s (%.1fs)", src.name, final, _time.monotonic() - _t0)
         return final
     except subprocess.TimeoutExpired as exc:
+        logger.error("[office] conversion timed out for '%s' (>120s)", src.name)
         raise OCRLoaderError("LibreOffice conversion timed out (>120s).") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.error("[office] soffice failed (exit %s) for '%s': %s", exc.returncode, src.name, detail)
         raise OCRLoaderError(
             f"LibreOffice failed to convert '{src.name}'"
             + (f": {detail}" if detail else "")
@@ -338,6 +371,7 @@ def _office_to_pdf_bytes(data: bytes, ext: str) -> str:
     Office formats can't be sniffed from magic bytes (all are ZIP containers),
     so the caller must supply the extension (e.g. taken from the URL path).
     """
+    logger.info("[office] %d office bytes (ext=%s) -> temp file for conversion", len(data), ext)
     fd, tmp = tempfile.mkstemp(suffix=ext, prefix="ocr_mcp_dl_")
     try:
         with os.fdopen(fd, "wb") as f:
@@ -373,6 +407,7 @@ def load_image(source: str) -> Any:
     if not isinstance(source, str) or not source.strip():
         raise OCRLoaderError("Image source is empty.")
 
+    logger.info("[load] resolving input source (%d chars)", len(source))
     src = source.strip()
 
     # 1) Existing local file -> office docs are converted to PDF first; images
@@ -381,8 +416,11 @@ def load_image(source: str) -> Any:
     candidate = Path(src)
     try:
         if candidate.exists() and candidate.is_file():
-            if candidate.suffix.lower() in _OFFICE_EXTS:
+            suffix = candidate.suffix.lower()
+            if suffix in _OFFICE_EXTS:
+                logger.info("[load] local office doc (%s) -> convert to PDF", suffix)
                 return _office_to_pdf(str(candidate))
+            logger.info("[load] local %s file -> pass-through path", suffix or "(no ext)")
             return str(candidate.resolve())
     except (OSError, ValueError):
         # Some strings (e.g. long base64 blobs) are not valid path encodings on
@@ -393,18 +431,28 @@ def load_image(source: str) -> Any:
     # 2) http(s) URL -> raw bytes; dispatch by content (PDF) or URL extension
     #    (office docs are ZIP containers, so they can't be sniffed from bytes).
     if lowered.startswith("http://") or lowered.startswith("https://"):
+        logger.info("[load] source is http(s) URL")
         data = _download_bytes(src)
         if _is_pdf_bytes(data):
+            logger.info("[load] downloaded content is PDF -> materialize")
             return _materialize_pdf(data)
         url_ext = Path(urlparse(src).path).suffix.lower()
         if url_ext in _OFFICE_EXTS:
+            logger.info("[load] downloaded content is office doc (%s) -> convert", url_ext)
             return _office_to_pdf_bytes(data, url_ext)
+        logger.info("[load] downloaded content is image -> decode")
         return _bytes_to_ndarray(data)
     # 3) data-URI / base64 -> raw bytes; same PDF/image dispatch.
     if lowered.startswith("data:") or _looks_like_base64(src):
+        logger.info("[load] source is %s", "data-URI" if lowered.startswith("data:") else "base64")
         data = _decode_to_bytes(src)
-        return _materialize_pdf(data) if _is_pdf_bytes(data) else _bytes_to_ndarray(data)
+        if _is_pdf_bytes(data):
+            logger.info("[load] decoded content is PDF -> materialize")
+            return _materialize_pdf(data)
+        logger.info("[load] decoded content is image -> decode")
+        return _bytes_to_ndarray(data)
 
+    logger.warning("[load] unrecognized input source type")
     raise OCRLoaderError(
         "Image source is not a recognizable local path, http(s) URL, "
         "or base64/data-URI string."
@@ -487,13 +535,21 @@ def run_ocr(engine: Any, image_input: Any) -> list[dict[str, Any]]:
     are expressed in each page's own coordinate space.
     """
     image_input = _resize_for_ocr(image_input)
+    logger.info("[ocr] calling engine.predict()")
+    import time as _time
+    _t0 = _time.monotonic()
     results = engine.predict(image_input)
+    logger.info("[ocr] engine.predict returned in %.1fs", _time.monotonic() - _t0)
     items = results if isinstance(results, list) else [results]
+    logger.info("[ocr] %d page(s) to normalize", len(items))
     lines: list[dict[str, Any]] = []
     for page_idx, res in enumerate(items):
-        for line in _normalize_result(res):
+        page_lines = _normalize_result(res)
+        logger.info("[ocr] page %d: %d lines", page_idx, len(page_lines))
+        for line in page_lines:
             line["page"] = page_idx
             lines.append(line)
+    logger.info("[ocr] done, %d total lines", len(lines))
     return lines
 
 
@@ -514,10 +570,12 @@ def _resize_for_ocr(image_input: Any) -> Any:
         # PDFs are handed to PaddleOCR natively (read page by page with
         # PyMuPDF inside the engine), so never try to open them with Pillow.
         if image_input.lower().endswith(".pdf"):
+            logger.info("[resize] PDF input, skipping (max_side=%d)", max_side)
             return image_input
         try:
             img = Image.open(image_input)
         except Exception:
+            logger.warning("[resize] could not open %s with Pillow, skipping", image_input)
             return image_input
     elif isinstance(image_input, np.ndarray):
         img = Image.fromarray(image_input)
@@ -527,6 +585,9 @@ def _resize_for_ocr(image_input: Any) -> Any:
     if max(img.size) > max_side:
         ratio = max_side / max(img.size)
         new_size = (int(img.width * ratio), int(img.height * ratio))
+        logger.info("[resize] downscaling %s -> %s (max_side=%d)", img.size, new_size, max_side)
         img = img.resize(new_size)
+    else:
+        logger.info("[resize] no resize needed (%s <= %d)", img.size, max_side)
 
     return np.array(img.convert("RGB"))

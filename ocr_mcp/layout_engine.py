@@ -18,12 +18,15 @@ from __future__ import annotations
 import html as _html
 import os
 import re
+import logging
 import threading
 from typing import Any
 
 # The shared image-loading helpers (path / URL / base64 / data-URI) live in the
 # OCR module; layout analysis needs exactly the same input parsing.
 from .ocr_engine import OCRLoaderError, _resize_for_ocr, load_image
+
+logger = logging.getLogger("ocr_mcp.layout")
 
 
 class LayoutEngineError(RuntimeError):
@@ -111,12 +114,17 @@ class LayoutEngine:
             if engine is not None:
                 return engine
             try:
+                logger.info("[layout-engine] first use for lang '%s', creating PP-Structure instance (may download models)...", lang)
+                import time as _time
+                _t0 = _time.monotonic()
                 engine = _create_pp_structure(lang)
+                logger.info("[layout-engine] PP-Structure instance for '%s' ready in %.1fs", lang, _time.monotonic() - _t0)
             except Exception as exc:
                 # paddlex wraps a missing optional dependency (premailer, shapely,
                 # openpyxl, ...) into a generic "A dependency error occurred
                 # during pipeline creation" RuntimeError, hiding which package is
                 # actually missing. Surface the original cause + an install hint.
+                logger.error("[layout-engine] failed to create PP-Structure for '%s': %s", lang, exc, exc_info=True)
                 msg = str(exc)
                 if "dependency" in msg.lower() or "No module" in msg:
                     msg += (
@@ -430,13 +438,19 @@ def run_layout(engine: Any, image_input: Any) -> tuple[dict[str, Any], str]:
     as Markdown tables.
     """
     image_input = _resize_for_ocr(image_input)
+    logger.info("[layout] calling engine.predict()")
+    import time as _time
+    _t0 = _time.monotonic()
     results = engine.predict(image_input)
+    logger.info("[layout] engine.predict returned in %.1fs", _time.monotonic() - _t0)
     if results is None:
+        logger.warning("[layout] engine.predict returned None (no results)")
         return {"regions": [], "tables": [], "page_count": 0}, ""
 
     # Predict may yield a list (3.x, one result per PDF page) or already a
     # single result (legacy 2.x / single image).
     items = results if isinstance(results, list) else [results]
+    logger.info("[layout] %d page(s) to normalize", len(items))
 
     merged_regions: list[dict[str, Any]] = []
     merged_tables: list[dict[str, Any]] = []
@@ -444,6 +458,10 @@ def run_layout(engine: Any, image_input: Any) -> tuple[dict[str, Any], str]:
     width = height = None
     for page_idx, res in enumerate(items):
         norm = _normalize_layout_result(res)
+        logger.info(
+            "[layout] page %d: %d regions, %d tables",
+            page_idx, len(norm["regions"]), len(norm["tables"]),
+        )
         for region in norm["regions"]:
             region["page"] = page_idx
             merged_regions.append(region)
@@ -461,6 +479,10 @@ def run_layout(engine: Any, image_input: Any) -> tuple[dict[str, Any], str]:
         markdown = "\n\n---\n\n".join(md_clean)
     else:
         markdown = md_clean[0] if md_clean else ""
+    logger.info(
+        "[layout] done, %d pages, %d regions, %d tables, markdown=%d chars",
+        len(items), len(merged_regions), len(merged_tables), len(markdown or ""),
+    )
 
     structure = {
         "regions": merged_regions,

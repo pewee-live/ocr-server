@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import logging
 from typing import Any
+
+import numpy as np
 
 import anyio
 
@@ -35,6 +38,28 @@ from .layout_engine import (
     LayoutEngineError,
     run_layout,
 )
+
+logger = logging.getLogger("ocr_mcp.server")
+
+
+def _setup_logging() -> None:
+    """Configure root logging once at startup.
+
+    PaddleOCR/PaddleX dump a lot at INFO; we only promote our own package to
+    the configured level and keep noisy third-party libs at WARNING so the
+    server log stays readable. Override the level with OCR_LOG_LEVEL.
+    """
+    level = os.getenv("OCR_LOG_LEVEL", "INFO").strip().upper()
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Quieten the very chatty paddle/paddlex loggers unless explicitly lowered.
+    for noisy in ("paddle", "paddlex", "paddleocr"):
+        if logging.getLogger(noisy).level == logging.NOTSET:
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 mcp = FastMCP(
     "PaddleOCR",
@@ -78,6 +103,16 @@ def _blocking_recognize(engine: Any, image_input: Any) -> list[dict[str, Any]]:
     return run_ocr(engine, image_input)
 
 
+def _describe_input(image_input: Any) -> str:
+    """Human-readable one-liner describing a loaded input for log messages."""
+    if isinstance(image_input, str):
+        tag = "pdf-path" if image_input.lower().endswith(".pdf") else "file-path"
+        return f"{tag}: {image_input}"
+    if isinstance(image_input, np.ndarray):
+        return f"ndarray: {image_input.shape}"
+    return f"{type(image_input).__name__}: {image_input!r}"
+
+
 @mcp.tool()
 async def recognize_text(
     image: str,
@@ -109,22 +144,31 @@ async def recognize_text(
             Note: the top-level key is "recognized_text" rather than "text"
             because Dify reserves "text" as a workflow variable name.
         """
+    logger.info("recognize_text: start (lang=%s, detail=%s, min_confidence=%s)", language, detail, min_confidence)
     try:
         lang = resolve_lang(language)
+        logger.info("recognize_text: resolved language '%s' -> '%s'", language, lang)
         engine = _engine.get_engine(lang)
+        logger.info("recognize_text: engine ready for lang '%s'", lang)
         image_input = load_image(image)
+        logger.info("recognize_text: input loaded -> %s", _describe_input(image_input))
     except (ValueError, OCRLoaderError) as exc:
+        logger.error("recognize_text: input/engine failed: %s", exc, exc_info=True)
         return {"error": str(exc), "language": None, "count": 0, "recognized_text": ""}
 
     if ctx is not None:
         await ctx.info(f"Running OCR ({lang}) ...")
 
     try:
+        logger.info("recognize_text: running PaddleOCR.predict (offloaded to worker thread)")
         # Offload the blocking inference so the event loop stays responsive.
         items = await anyio.to_thread.run_sync(_blocking_recognize, engine, image_input)
+        logger.info("recognize_text: predict done, %d lines", len(items))
 
         if min_confidence and min_confidence > 0.0:
+            before = len(items)
             items = [it for it in items if (it["confidence"] or 0.0) >= min_confidence]
+            logger.info("recognize_text: min_confidence filter %d -> %d lines", before, len(items))
 
         lines = [it["text"] for it in items]
         result: dict[str, Any] = {
@@ -145,7 +189,20 @@ async def recognize_text(
                 for it in items
             ],
         }
+        logger.info("recognize_text: success, %d lines returned", len(lines))
         return result
+    except Exception as exc:
+        # PaddleOCR inference (predict) can fail at runtime for many reasons
+        # (OOM, corrupt image, model load failure, native segfault-adjacent
+        # crashes, ...). Catch them here so the client gets a structured error
+        # instead of a raw traceback, and the server log records the full stack.
+        logger.error("recognize_text: inference failed: %s", exc, exc_info=True)
+        return {
+            "error": f"OCR inference failed: {exc}",
+            "language": lang,
+            "count": 0,
+            "recognized_text": "",
+        }
     finally:
         # Remove temp PDFs created for URL/base64 sources; no-op for images.
         release_input(image_input)
@@ -197,27 +254,37 @@ async def recognize_layout(
         tables html/markdown}), "tables" (each {html, markdown, box,
         cell_count}), and "markdown" (the full page rendered as Markdown with
         table layout preserved). On error returns {"error": ...}.
-    """
+        """
+    logger.info("recognize_layout: start (lang=%s, output=%s, flat=%s)", language, output, flat)
     try:
         lang = resolve_lang(language)
+        logger.info("recognize_layout: resolved language '%s' -> '%s'", language, lang)
         engine = _layout_engine.get_engine(lang)
+        logger.info("recognize_layout: layout engine ready for lang '%s'", lang)
         image_input = load_image(image)
+        logger.info("recognize_layout: input loaded -> %s", _describe_input(image_input))
     except (ValueError, OCRLoaderError, LayoutEngineError) as exc:
-       return {
-           "error": str(exc),
-           "language": None,
+        logger.error("recognize_layout: input/engine failed: %s", exc, exc_info=True)
+        return {
+            "error": str(exc),
+            "language": None,
             "region_count": 0,
             "table_count": 0,
-           "markdown": "",
-           "regions_json": "[]",
-           "tables_json": "[]",
+            "markdown": "",
+            "regions_json": "[]",
+            "tables_json": "[]",
         }
 
     if ctx is not None:
         await ctx.info(f"Running layout analysis ({lang}) ...")
 
     try:
+        logger.info("recognize_layout: running PP-Structure.predict (offloaded to worker thread)")
         structure, md = await anyio.to_thread.run_sync(run_layout, engine, image_input)
+        logger.info(
+            "recognize_layout: predict done, %d pages, %d regions, %d tables",
+            structure.get("page_count"), len(structure.get("regions", [])), len(structure.get("tables", [])),
+        )
 
         regions = structure.get("regions", [])
         tables = structure.get("tables", [])
@@ -253,7 +320,26 @@ async def recognize_layout(
             result["page_count"] = structure["page_count"]
         if output == "text":
             result["text"] = "\n\n".join(r.get("text", "") for r in regions)
+        logger.info(
+            "recognize_layout: success, %d regions, %d tables, markdown=%d chars",
+            len(regions), len(tables), len(md or ""),
+        )
         return result
+    except Exception as exc:
+        # PP-Structure inference (predict) can fail at runtime for many reasons
+        # (OOM, corrupt image, model load failure, dependency errors, ...).
+        # Catch them here so the client gets a structured error instead of a raw
+        # traceback, and the server log records the full stack.
+        logger.error("recognize_layout: inference failed: %s", exc, exc_info=True)
+        return {
+            "error": f"Layout analysis failed: {exc}",
+            "language": lang,
+            "region_count": 0,
+            "table_count": 0,
+            "markdown": "",
+            "regions_json": "[]",
+            "tables_json": "[]",
+        }
     finally:
         # Remove temp PDFs created for URL/base64 sources; no-op for images.
         release_input(image_input)
@@ -268,6 +354,8 @@ def _select_transport() -> str:
 
 def main() -> None:
     """Entry point: run the server with the transport from the environment."""
+    _setup_logging()
+    logger.info("Starting PaddleOCR MCP server")
     mcp.settings.transport_security = _build_transport_security()
     transport = _select_transport()
     if transport == "streamable-http":
