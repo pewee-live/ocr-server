@@ -15,7 +15,10 @@ import re
 import sysconfig
 import threading
 import tempfile
+import shutil
+import subprocess
 import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
 
@@ -256,6 +259,97 @@ def release_input(image_input: Any) -> None:
             pass
 
 
+# Office document extensions convertible to PDF via LibreOffice headless.
+# doc/docx/ppt/pptx/xls/xlsx (and ODF equivalents) have no text layer PaddleOCR
+# can read directly, so they are rasterized to PDF first, then flow through the
+# existing native-PDF path (page-by-page inference).
+_OFFICE_EXTS = {
+    ".doc", ".docx", ".rtf", ".odt",
+    ".ppt", ".pptx", ".odp",
+    ".xls", ".xlsx", ".ods",
+}
+
+
+def _office_to_pdf(src_path: str) -> str:
+    """Convert an office document to a temp PDF via LibreOffice headless.
+
+    Returns the path of the produced PDF (tracked in ``_TEMP_PATHS`` for cleanup
+    via release_input()). Uses a unique ``-env:UserInstallation`` profile per call
+    so concurrent soffice processes don't contend on a shared profile lock.
+    """
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise OCRLoaderError(
+            "LibreOffice (soffice) is not installed; cannot convert office "
+            "documents. Install it in the server environment to enable "
+            "doc/ppt/xls support."
+        )
+    src = Path(src_path)
+    outdir = tempfile.mkdtemp(prefix="lo_out_")
+    profile = tempfile.mkdtemp(prefix="lo_prof_")
+    try:
+        subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--norestore",
+                "--nofirststartwizard",
+                f"-env:UserInstallation=file:///{profile}",
+                "--convert-to", "pdf",
+                "--outdir", outdir,
+                str(src),
+            ],
+            timeout=120,
+            check=True,
+            capture_output=True,
+        )
+        pdf = Path(outdir) / f"{src.stem}.pdf"
+        if not pdf.exists():
+            raise OCRLoaderError(
+                f"LibreOffice produced no PDF for '{src.name}'. The file may be "
+                "corrupted or in an unsupported format."
+            )
+        # Move the PDF out of the temp outdir into its own tracked temp file so
+        # the outdir can be cleaned up immediately.
+        fd, final = tempfile.mkstemp(suffix=".pdf", prefix="ocr_mcp_")
+        os.close(fd)
+        shutil.move(str(pdf), final)
+        _TEMP_PATHS.add(final)
+        return final
+    except subprocess.TimeoutExpired as exc:
+        raise OCRLoaderError("LibreOffice conversion timed out (>120s).") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise OCRLoaderError(
+            f"LibreOffice failed to convert '{src.name}'"
+            + (f": {detail}" if detail else "")
+       ) from exc
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def _office_to_pdf_bytes(data: bytes, ext: str) -> str:
+    """Convert raw office-document bytes to a temp PDF.
+
+    Writes the bytes to a temp file (so LibreOffice gets a real path + extension
+    to infer the format from), converts it, then removes the temp source. The
+    produced PDF is tracked in ``_TEMP_PATHS`` for release_input() cleanup.
+    Office formats can't be sniffed from magic bytes (all are ZIP containers),
+    so the caller must supply the extension (e.g. taken from the URL path).
+    """
+    fd, tmp = tempfile.mkstemp(suffix=ext, prefix="ocr_mcp_dl_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return _office_to_pdf(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _looks_like_base64(src: str) -> bool:
     compact = re.sub(r"\s+", "", src)
     # A real encoded image is far longer than this threshold; this avoids
@@ -266,25 +360,29 @@ def _looks_like_base64(src: str) -> bool:
 
 
 def load_image(source: str) -> Any:
-    """Resolve an image/PDF source to something ``PaddleOCR.predict`` accepts.
+    """Resolve an image/PDF/office-doc source to something PaddleOCR accepts.
 
-    Accepts a local file path (image or PDF), an http(s) URL, a data URI, or a
-    raw base64 string. Images become an ``np.ndarray`` (RGB) or are returned as
-    a path for PaddleOCR to read directly; PDFs are always returned as a file
-    path so PaddleOCR can read them natively (page by page). Temp PDF files
-    created for URL/base64 sources are tracked for cleanup via release_input().
+    Accepts a local file path (image, PDF, or office doc), an http(s) URL, a data
+    URI, or a raw base64 string. Images become an ``np.ndarray`` (RGB) or are
+    returned as a path for PaddleOCR to read directly; PDFs are always returned
+    as a file path so PaddleOCR can read them natively (page by page). Office
+    documents (doc/docx/ppt/pptx/xls/xlsx/...) are first converted to PDF via
+    LibreOffice, then treated as PDFs. Temp files created for URL/base64/office
+    sources are tracked for cleanup via release_input().
     """
     if not isinstance(source, str) or not source.strip():
         raise OCRLoaderError("Image source is empty.")
 
     src = source.strip()
 
-    # 1) Existing local file (image OR PDF) -> let PaddleOCR read the path
-    #    directly. PaddleOCR/PaddleX read PDFs natively (via PyMuPDF), one
-    #    result object per page, so we never pre-decode PDFs here.
+    # 1) Existing local file -> office docs are converted to PDF first; images
+    #    and PDFs are passed through for PaddleOCR to read directly (it reads
+    #    PDFs natively via PyMuPDF, one result object per page).
     candidate = Path(src)
     try:
         if candidate.exists() and candidate.is_file():
+            if candidate.suffix.lower() in _OFFICE_EXTS:
+                return _office_to_pdf(str(candidate))
             return str(candidate.resolve())
     except (OSError, ValueError):
         # Some strings (e.g. long base64 blobs) are not valid path encodings on
@@ -292,10 +390,16 @@ def load_image(source: str) -> Any:
         pass
 
     lowered = src.lower()
-    # 2) http(s) URL -> raw bytes; dispatch PDFs to a temp file, images to array.
+    # 2) http(s) URL -> raw bytes; dispatch by content (PDF) or URL extension
+    #    (office docs are ZIP containers, so they can't be sniffed from bytes).
     if lowered.startswith("http://") or lowered.startswith("https://"):
         data = _download_bytes(src)
-        return _materialize_pdf(data) if _is_pdf_bytes(data) else _bytes_to_ndarray(data)
+        if _is_pdf_bytes(data):
+            return _materialize_pdf(data)
+        url_ext = Path(urlparse(src).path).suffix.lower()
+        if url_ext in _OFFICE_EXTS:
+            return _office_to_pdf_bytes(data, url_ext)
+        return _bytes_to_ndarray(data)
     # 3) data-URI / base64 -> raw bytes; same PDF/image dispatch.
     if lowered.startswith("data:") or _looks_like_base64(src):
         data = _decode_to_bytes(src)

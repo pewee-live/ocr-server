@@ -6,8 +6,8 @@
 任意 MCP 客户端调用,也可作为 Docker 镜像通过网络服务对外提供 OCR 能力。
 
 除纯文本识别外,还集成 **PP-Structure 版面分析**:对含表格/标题/段落的表单或
-文档,可自动还原版面结构,把图片或 PDF 中的表格直接转换为 HTML 与 Markdown 表格代码
-(保留行列结构),并返回每个文本区块的坐标框(Bounding Box)。PDF 按页逐张处理。
+文档,可自动还原版面结构,把图片、PDF 或办公文档(PPT/Word/Excel)中的表格直接转换为 HTML 与 Markdown 表格代码
+(保留行列结构),并返回每个文本区块的坐标框(Bounding Box)。PDF 与多页文档按页逐张处理。
 
 提供两种运行方式,均支持 HTTP(`streamable-http`)传输:
 
@@ -18,10 +18,13 @@
 
 - 基于官方 MCP Python SDK(FastMCP),标准 `stdio` 与 `streamable-http` 双传输。
 - 每种语言独立缓存 OCR 引擎实例,首次调用懒加载、后续秒级响应。
-- 图片与 PDF 输入均支持本地路径、`http(s)` URL、`data:` URI、裸 base64 字符串。
+- 图片、PDF、办公文档输入均支持本地路径、`http(s)` URL、`data:` URI、裸 base64 字符串。
 - **原生 PDF 支持**:PDF 交给 PaddleOCR/PaddleX 按页逐张处理(依赖 PyMuPDF),
   多页结果自动合并,每个文本行/区块/表格都带 `page` 页码;`recognize_layout`
   额外返回 `page_count` 总页数。
+- **办公文档支持**:Word(`doc`/`docx`)、PPT(`ppt`/`pptx`)、Excel(`xls`/`xlsx`)及
+  ODF 格式(`odt`/`odp`/`ods`)先由内置的 LibreOffice headless 转成 PDF,再走 PDF 管道。
+  办公文档需通过本地路径或带扩展名的 URL 提供(裸 base64 不支持,因 ZIP 容器无法靠魔数嗅探)。
 - 返回每行文本、**文本框坐标(Bounding Box)** 与置信度。
 - **版面分析(`recognize_layout`)**:基于 PP-Structure 还原标题/段落/表格/图片
   等版面区块,表格输出 HTML 与 Markdown(保留行列),并按阅读顺序返回各区块坐标。
@@ -317,11 +320,11 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 
 ### `recognize_text`
 
-对图片或 PDF 执行 OCR 文本识别。
+对图片、PDF 或办公文档执行 OCR 文本识别。
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64;支持图片与 PDF |
+| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64;支持图片、PDF 与办公文档(doc/ppt/xls 等) |
 | `language` | string | `"ch"` | 语言代码:`ch` / `en` / `japan` / `korean` |
 | `detail` | bool | `false` | 坐标框 `box` 始终返回;为 `true` 时额外返回置信度 `confidence` |
 | `min_confidence` | float | `0.0` | 过滤低于该置信度的行(0-1,0 表示保留全部)|
@@ -350,7 +353,7 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 
 ### `recognize_layout`
 
-对图片或 PDF 执行**版面分析**(基于 PP-Structure),还原表格/标题/段落等结构。
+对图片、PDF 或办公文档执行**版面分析**(基于 PP-Structure),还原表格/标题/段落等结构。
 
 与 `recognize_text`(扁平文本行)不同,它把页面切分为多个版面区块
 (`title`/`text`/`table`/`figure`/`formula`/...),识别表格并转为 HTML 与 Markdown
@@ -358,7 +361,7 @@ Windows:`%APPDATA%\Claude\claude_desktop_config.json`):
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64;支持图片与 PDF |
+| `image` | string | 必填 | 本地文件路径、`http(s)` URL、`data:image/...;base64,...` 或裸 base64;支持图片、PDF 与办公文档(doc/ppt/xls 等) |
 | `language` | string | `"ch"` | 语言代码:`ch` / `en` / `japan` / `korean` |
 | `output` | string | `"markdown"` | 顶层便捷内容:`markdown`(整页 Markdown,表格保留)或 `text`(仅扁平文本)。结构化数据(`regions`/`tables`)始终返回 |
 | `flat` | bool | `true` | 输出形态开关,见下方「返回形态」:**Dify 用 `true`(默认)**,把 `regions`/`tables` 序列化为 JSON 字符串;Codex / Claude / 原始 MCP 用 `false` 取回嵌套 dict |
@@ -532,6 +535,11 @@ ocr-server/
   再透传路径(URL/base64 无法被引擎当字节消费),并在推理后清理临时文件;本地 PDF 路径则
   原样透传。多页结果按页合并,每行/区块/表格带 `page`,`recognize_layout` 额外返回 `page_count`,
   多页 Markdown 以 `---` 分页。
+- **办公文档支持**:Word/PPT/Excel(`doc`/`docx`/`ppt`/`pptx`/`xls`/`xlsx`/`odt`/`odp`/`ods`)
+  先由内置 LibreOffice headless 转成 PDF,再走上述 PDF 管道。每次调用用独立的
+  `UserInstallation` profile 目录,避免并发 `soffice` 实例争用共享锁;转换产物作为临时 PDF
+  追踪并由 `release_input` 清理。镜像需安装 LibreOffice + `fonts-noto-cjk`(无中文字体会渲染成豆腐块,
+  OCR 出来是乱码)。办公文档仅支持本地路径与带扩展名的 URL(裸 base64 不支持,因 OOZIP 容器无法靠魔数嗅探)。
 
 ## 依赖版本
 

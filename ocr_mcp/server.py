@@ -40,8 +40,10 @@ mcp = FastMCP(
     "PaddleOCR",
     instructions=(
         "OCR service backed by PaddleOCR (PP-OCRv5). Supports Chinese, English, "
-        "Japanese and Korean. Accepts images and PDFs (local path, http(s) URL, "
-        "or base64). Use list_supported_languages to see language codes, "
+        "Japanese and Korean. Accepts images, PDFs and office documents "
+        "(doc/docx/ppt/pptx/xls/xlsx) via local path, http(s) URL, or base64; "
+        "office docs are converted to PDF first. Use list_supported_languages "
+        "to see language codes, "
         "then recognize_text to extract text (with bounding boxes); "
         "recognize_layout to recover page structure and tables (HTML + Markdown)."
     ),
@@ -87,9 +89,12 @@ async def recognize_text(
     """Recognize text in an image using PaddleOCR (PP-OCRv5).
 
     Args:
-        image: Local file path (image or PDF), an http(s) URL, a data URI
-            ("data:image/png;base64,..."), or a raw base64 string. PDF files
-            are read natively by PaddleOCR and processed page by page.
+        image: Local file path (image, PDF, or office doc), an http(s) URL, a
+            data URI ("data:image/png;base64,..."), or a raw base64 string.
+            PDFs are read natively by PaddleOCR page by page; office documents
+            (doc/docx/ppt/pptx/xls/xlsx/...) are first converted to PDF via
+            LibreOffice. Office docs via URL use the file extension; base64
+            office docs are not supported.
         language: OCR language - "ch" (Chinese+English), "en" (English),
             "japan" (Japanese), "korean" (Korean). Default "ch".
         detail: When true, also include per-line confidence scores. Bounding
@@ -171,9 +176,12 @@ async def recognize_layout(
     Markdown, and reconstructs the reading order.
 
     Args:
-        image: Local file path (image or PDF), an http(s) URL, a data URI
-            ("data:image/png;base64,..."), or a raw base64 string. PDF files
-            are read natively by PaddleOCR and processed page by page.
+        image: Local file path (image, PDF, or office doc), an http(s) URL, a
+            data URI ("data:image/png;base64,..."), or a raw base64 string.
+            PDFs are read natively by PaddleOCR page by page; office documents
+            (doc/docx/ppt/pptx/xls/xlsx/...) are first converted to PDF via
+            LibreOffice. Office docs via URL use the file extension; base64
+            office docs are not supported.
         language: OCR language - "ch" / "en" / "japan" / "korean". Default "ch".
         output: Top-level convenience content - "markdown" (the whole page as
             Markdown, tables preserved) or "text" (flattened text only).
